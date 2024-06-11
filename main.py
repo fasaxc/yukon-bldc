@@ -1,3 +1,4 @@
+import array
 import time
 from machine import Pin
 import micropython
@@ -73,26 +74,37 @@ yukon = Yukon()     # A new Yukon object
 led_state = False   # The state of the LED
 
 # Wrap the code in a try block, to catch any exceptions (including KeyboardInterrupt)
-try:
-    # Loop until the BOOT/USER button is pressed
+
+def run():
+    # Using a 16-bit array so that StateMachine.get() discards the 
+    # top 16 bits, which prevents our value from spilling to the 
+    # heap.
+    sm_buf = array.array('H',[0])
+
+    sm1.get(sm_buf)
+    invl = 0xffff - sm_buf[0]
     while not yukon.is_boot_pressed():
-        pin_debug.high()
+        
         while 1:
-            high = 0xffffffff - sm0.get()
+            sm0.get(sm_buf)
             if sm0.rx_fifo() == 0:
                 break
-        while sm1.rx_fifo() > 0:
-            ivl = 0xffffffff - sm1.get()
+        high = 0xffff - sm_buf[0] 
 
-        duty = high*4119//ivl - 15
+        while sm1.rx_fifo() > 0:
+            sm1.get(sm_buf)
+            invl = 0xffff - sm_buf[0]
+
+        pin_debug.on()
+        duty = high*4119//invl - 15
         if duty < 0:
             duty = 0
         if duty > 4095:
             duty = 0
-        
-        pin_debug.low()
-        gc.collect()
-        #print("{:6} {:6} {:4} {:.2f}".format(ivl, high, duty, duty*360/4096))
+        pin_debug.off()
+        print(duty, duty*360//4096)
+try:
+    run()
 
 finally:
     # Put the board back into a safe state, regardless of how the program may have ended
