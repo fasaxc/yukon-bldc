@@ -1,6 +1,8 @@
 import array
+import math
 import time
-from machine import Pin
+import machine
+from machine import Pin, PWM
 import micropython
 import rp2
 import gc
@@ -75,7 +77,63 @@ led_state = False   # The state of the LED
 
 # Wrap the code in a try block, to catch any exceptions (including KeyboardInterrupt)
 
+
+
+pwms = [PWM(Pin(n)) for n in [20, 21, 22]]
+
+PWM_BASE = 0x40050000
+PWM_EN = PWM_BASE + 0xa0
+PWM_INTR = PWM_BASE + 0xa4
+
+PWM_REGS = {}
+
+for bank in range(8):
+    bank_base = PWM_BASE + 0x14*bank
+    PWM_REGS[bank] = {
+        "CSR": bank_base,
+        "CTR": bank_base + 0x08,    
+    }
+
+PWM_BANK_LO = 2
+PWM_BANK_HI = 3
+
+# Set the PWM frequency.
+f = 40000
+ivl = 0.99/f
+for pwm in pwms:
+    pwm.freq(f*2)  # *2 for phase accurate PWM
+
+# Sync PWMs. EN register mirrors enable bits for individual PWMs.
+machine.mem32[PWM_EN] = 0
+machine.mem32[PWM_REGS[PWM_BANK_LO]["CSR"]] = machine.mem32[PWM_REGS[PWM_BANK_LO]["CSR"]] | 0x2
+machine.mem32[PWM_REGS[PWM_BANK_HI]["CSR"]] = machine.mem32[PWM_REGS[PWM_BANK_HI]["CSR"]] | 0x2
+machine.mem32[PWM_REGS[PWM_BANK_LO]["CTR"]] = 0
+machine.mem32[PWM_REGS[PWM_BANK_HI]["CTR"]] = 0
+machine.mem32[PWM_EN] = (1<<2) | (1 <<3)
+
+third = 128
+lut_len = third * 3
+offset = 0.016
+lut = [
+    min(
+        int(((math.sin(i * 2 * math.pi / lut_len) + 1)/2 + offset) / (1+offset) * 65535),
+        65535
+    ) for i in range(lut_len)]
+
+
 def run():
+    yukon.enable_main_output()
+    while True:
+        for i in range(lut_len):
+            pin_debug.toggle()
+            while machine.mem32[PWM_INTR] == 0:
+                pass
+            machine.mem32[PWM_INTR] = 0x7f
+            pwms[0].duty_u16(lut[i])
+            pwms[1].duty_u16(lut[(i+third)%lut_len])
+            pwms[2].duty_u16(lut[(i+2*third)%lut_len])
+
+
     # Using a 16-bit array so that StateMachine.get() discards the 
     # top 16 bits, which prevents our value from spilling to the 
     # heap.
@@ -97,6 +155,7 @@ def run():
 
         pin_debug.on()
         duty = high*4119//invl - 15
+        # TODO: <16 means "error"
         if duty < 0:
             duty = 0
         if duty > 4095:
@@ -108,4 +167,6 @@ try:
 
 finally:
     # Put the board back into a safe state, regardless of how the program may have ended
+    for pwm in pwms:
+        pwm.duty_u16(0)
     yukon.reset()
