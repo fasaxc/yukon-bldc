@@ -111,8 +111,8 @@ machine.mem32[PWM_REGS[PWM_BANK_LO]["CTR"]] = 0
 machine.mem32[PWM_REGS[PWM_BANK_HI]["CTR"]] = 0
 machine.mem32[PWM_EN] = (1<<2) | (1 <<3)
 
-third = 128
-lut_len = third * 3
+lut_len = 4096
+third = 4096 // 3
 offset = 0.016
 lut = [
     min(
@@ -121,24 +121,82 @@ lut = [
     ) for i in range(lut_len)]
 
 
+def read_pwm_slow():
+    sm_buf = array.array('H',[0])
+    while 1:
+        sm0.get(sm_buf)
+        if sm0.rx_fifo() == 0:
+            sm0.get(sm_buf)
+            break
+    high = 0xffff - sm_buf[0] 
+
+    while 1:
+        sm1.get(sm_buf)
+        if sm1.rx_fifo() == 0:
+            sm1.get(sm_buf)
+            break
+    invl = 0xffff - sm_buf[0]
+    return high, invl
+
+
+def set_duty(angle, power):
+    pwms[0].duty_u16(lut[angle%lut_len] * power // 4096)
+    pwms[1].duty_u16(lut[(angle+third)%lut_len] * power // 4096)
+    pwms[2].duty_u16(lut[(angle+2*third)%lut_len] * power // 4096)
+
+
+def clamp_angle(angle):
+    while angle >= 2048:
+        angle -= 4096
+    while angle < -2048:
+        angle += 4096
+    return angle
+
+
 def run():
     yukon.enable_main_output()
-    while True:
-        for i in range(lut_len):
-            pin_debug.toggle()
-            while machine.mem32[PWM_INTR] == 0:
-                pass
-            machine.mem32[PWM_INTR] = 0x7f
-            pwms[0].duty_u16(lut[i])
-            pwms[1].duty_u16(lut[(i+third)%lut_len])
-            pwms[2].duty_u16(lut[(i+2*third)%lut_len])
 
+    while 1:
+        # Calibration: rotate by a quarter phase to capture the rotor.
+        # Seems to be a good angle to read off the angle offset.  Maybe
+        # because the first duty is at 100%?
+        for phase_angle in range(lut_len//4):
+            time.sleep_us(100)
+            pin_debug.on()
+            machine.mem32[PWM_INTR] = 0x7f
+            set_duty(phase_angle, 1024)
+            pin_debug.off()
+            
+        time.sleep_ms(500) # Let rotor settle.
+        high, invl = read_pwm_slow()
+        angle1 = clamp_angle(high*4096//invl)
+        print("Calibration interval A = {} / {} = {} = {}".format(high, invl, angle1, high*360/(invl*4096)))
+
+        for phase_angle in range(lut_len//4, lut_len*9//4):
+            time.sleep_us(100)
+            pin_debug.on()
+            machine.mem32[PWM_INTR] = 0x7f
+            set_duty(phase_angle, 1024)
+            pin_debug.off()
+            
+        time.sleep_ms(500) # Let rotor settle.
+        high2, invl2 = read_pwm_slow()
+        angle2 = clamp_angle(high2*4096//invl2)
+        print("Calibration interval B = {} / {} = {} = {}".format(high2, invl2, angle2, high2*360/(invl2*4096)))
+        delta = clamp_angle(angle2-angle1)
+        print("Delta = {} = {}".format(delta, delta*360/4096))
+        print("Num poles = {}".format((4096*2*32//abs(delta) + 15) // 32))
+
+    for pwm in pwms:
+        pwm.duty_u16(0)
+
+    while 1:
+        pass
 
     # Using a 16-bit array so that StateMachine.get() discards the 
     # top 16 bits, which prevents our value from spilling to the 
     # heap.
     sm_buf = array.array('H',[0])
-
     sm1.get(sm_buf)
     invl = 0xffff - sm_buf[0]
     while not yukon.is_boot_pressed():
