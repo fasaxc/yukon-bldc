@@ -153,40 +153,52 @@ def clamp_angle(angle):
     return angle
 
 
+def full_calibration():
+    # Calibration: rotate by a quarter phase to capture the rotor.
+    # Seems to be a good angle to read off the angle offset.  Maybe
+    # because the first duty is at 100%?
+    for phase_angle in range(lut_len//4):
+        time.sleep_us(100)
+        pin_debug.on()
+        machine.mem32[PWM_INTR] = 0x7f
+        set_duty(phase_angle, 1024)
+        pin_debug.off()
+        
+    time.sleep_ms(500) # Let rotor settle.
+    high, invl = read_pwm_slow()
+    angle1 = clamp_angle(high*4096//invl)
+    print("Calibration interval A = {} / {} = {} = {}".format(high, invl, angle1, angle1*360/4096))
+
+    for phase_angle in range(lut_len//4, lut_len*9//4):
+        time.sleep_us(100)
+        pin_debug.on()
+        machine.mem32[PWM_INTR] = 0x7f
+        set_duty(phase_angle, 1024)
+        pin_debug.off()
+        
+    time.sleep_ms(500) # Let rotor settle.
+    high2, invl2 = read_pwm_slow()
+    angle2 = clamp_angle(high2*4096//invl2)
+    print("Calibration interval B = {} / {} = {} = {}".format(high2, invl2, angle2, angle2*360/4096))
+    delta = clamp_angle(angle2-angle1)
+    print("Delta = {} = {}".format(delta, delta*360/4096))
+    num_pole_pairs = (4096*2*32//abs(delta) + 15) // 32
+    print("Pole pairs = {}".format(num_pole_pairs))
+
+    # Now we've got the number of poles, we can work out the phase offset.
+    pole_angle = 4096//4
+    meas_pole_angle = clamp_angle(angle1 * num_pole_pairs)
+    angle_offset = clamp_angle(pole_angle - meas_pole_angle)
+    print("Angle offset = {}".format(angle_offset))
+
+    return angle_offset, num_pole_pairs
+
+
 def run():
     yukon.enable_main_output()
-
-    while 1:
-        # Calibration: rotate by a quarter phase to capture the rotor.
-        # Seems to be a good angle to read off the angle offset.  Maybe
-        # because the first duty is at 100%?
-        for phase_angle in range(lut_len//4):
-            time.sleep_us(100)
-            pin_debug.on()
-            machine.mem32[PWM_INTR] = 0x7f
-            set_duty(phase_angle, 1024)
-            pin_debug.off()
-            
-        time.sleep_ms(500) # Let rotor settle.
-        high, invl = read_pwm_slow()
-        angle1 = clamp_angle(high*4096//invl)
-        print("Calibration interval A = {} / {} = {} = {}".format(high, invl, angle1, high*360/(invl*4096)))
-
-        for phase_angle in range(lut_len//4, lut_len*9//4):
-            time.sleep_us(100)
-            pin_debug.on()
-            machine.mem32[PWM_INTR] = 0x7f
-            set_duty(phase_angle, 1024)
-            pin_debug.off()
-            
-        time.sleep_ms(500) # Let rotor settle.
-        high2, invl2 = read_pwm_slow()
-        angle2 = clamp_angle(high2*4096//invl2)
-        print("Calibration interval B = {} / {} = {} = {}".format(high2, invl2, angle2, high2*360/(invl2*4096)))
-        delta = clamp_angle(angle2-angle1)
-        print("Delta = {} = {}".format(delta, delta*360/4096))
-        print("Num poles = {}".format((4096*2*32//abs(delta) + 15) // 32))
-
+    
+    angle_offset, num_pole_pairs = full_calibration()
+    
     for pwm in pwms:
         pwm.duty_u16(0)
 
