@@ -209,6 +209,9 @@ def run():
     sm_buf = array.array('H',[0])
     sm1.get(sm_buf)
     invl = 0xffff - sm_buf[0]
+
+    drive_offset = 1024
+    a_was_down = False
     
     while not yukon.is_boot_pressed():
         
@@ -232,12 +235,20 @@ def run():
 
         pole_angle = clamp_angle(duty * num_pole_pairs + angle_offset)
         
-        drive_angle = pole_angle + (1024 * 3)
+        drive_angle = pole_angle + drive_offset
         if drive_angle < 0:
             drive_angle += 4096
         drive_angle = drive_angle % 4096
         set_duty(drive_angle, 1024)
         pin_debug.off()
+
+        if yukon.is_pressed("A"):
+            if not a_was_down:
+                drive_offset = 4096-drive_offset
+                a_was_down = True
+        else:
+            a_was_down = False
+
 try:
     run()
 
