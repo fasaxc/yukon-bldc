@@ -146,6 +146,7 @@ def set_duty(angle, power):
 
 
 def clamp_angle(angle):
+    angle = angle % 4096
     while angle >= 2048:
         angle -= 4096
     while angle < -2048:
@@ -186,7 +187,7 @@ def full_calibration():
     print("Pole pairs = {}".format(num_pole_pairs))
 
     # Now we've got the number of poles, we can work out the phase offset.
-    pole_angle = 4096//4
+    pole_angle = 4096//4 # Angle we set when we did the measurement
     meas_pole_angle = clamp_angle(angle1 * num_pole_pairs)
     angle_offset = clamp_angle(pole_angle - meas_pole_angle)
     print("Angle offset = {}".format(angle_offset))
@@ -202,15 +203,13 @@ def run():
     for pwm in pwms:
         pwm.duty_u16(0)
 
-    while 1:
-        pass
-
     # Using a 16-bit array so that StateMachine.get() discards the 
     # top 16 bits, which prevents our value from spilling to the 
     # heap.
     sm_buf = array.array('H',[0])
     sm1.get(sm_buf)
     invl = 0xffff - sm_buf[0]
+    
     while not yukon.is_boot_pressed():
         
         while 1:
@@ -230,8 +229,15 @@ def run():
             duty = 0
         if duty > 4095:
             duty = 0
+
+        pole_angle = clamp_angle(duty * num_pole_pairs + angle_offset)
+        
+        drive_angle = pole_angle + (1024 * 3)
+        if drive_angle < 0:
+            drive_angle += 4096
+        drive_angle = drive_angle % 4096
+        set_duty(drive_angle, 1024)
         pin_debug.off()
-        print(duty, duty*360//4096)
 try:
     run()
 
