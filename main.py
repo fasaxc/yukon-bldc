@@ -111,14 +111,14 @@ machine.mem32[PWM_REGS[PWM_BANK_LO]["CTR"]] = 0
 machine.mem32[PWM_REGS[PWM_BANK_HI]["CTR"]] = 0
 machine.mem32[PWM_EN] = (1<<2) | (1 <<3)
 
-lut_len = 4096
+lut_len : int = 4096
 third = 4096 // 3
 offset = 0.016
-lut = [
+lut = array.array('H', [
     min(
         int(((math.sin(i * 2 * math.pi / lut_len) + 1)/2 + offset) / (1+offset) * 65535),
         65535
-    ) for i in range(lut_len)]
+    ) for i in range(lut_len)])
 
 
 def read_pwm_slow():
@@ -139,10 +139,13 @@ def read_pwm_slow():
     return high, invl
 
 
-def set_duty(angle, power):
-    pwms[0].duty_u16(lut[angle%lut_len] * power // 4096)
-    pwms[1].duty_u16(lut[(angle+third)%lut_len] * power // 4096)
-    pwms[2].duty_u16(lut[(angle+2*third)%lut_len] * power // 4096)
+@micropython.viper
+def set_duty(angle : int, power : int):
+    angle = angle % 4096
+    pwms[0].duty_u16(int(lut[angle]) * power // 4096)
+    angle2 = (angle+(4096 // 3))%4096
+    pwms[1].duty_u16(int(lut[angle2]) * power // 4096)
+    pwms[2].duty_u16(int(lut[(angle+(2 *4096 // 3))%4096]) * power // 4096)
 
 
 def clamp_angle(angle):
@@ -192,50 +195,54 @@ def full_calibration():
     angle_offset = clamp_angle(pole_angle - meas_pole_angle)
     print("Angle offset = {}".format(angle_offset))
 
-    return angle_offset, num_pole_pairs
-
-
-def run():
-    yukon.enable_main_output()
-    
-    angle_offset, num_pole_pairs = full_calibration()
-    
     for pwm in pwms:
         pwm.duty_u16(0)
 
-    # Using a 16-bit array so that StateMachine.get() discards the 
-    # top 16 bits, which prevents our value from spilling to the 
-    # heap.
-    sm_buf = array.array('H',[0])
-    sm1.get(sm_buf)
-    invl = 0xffff - sm_buf[0]
+    return angle_offset, num_pole_pairs
 
-    drive_offset = 1024
-    a_was_down = False
-    
-    while not yukon.is_boot_pressed():
-        
+
+class Motor:
+    def __init__(self) -> None:
+        # Using a 16-bit array so that StateMachine.get() discards the 
+        # top 16 bits, which prevents our value from spilling to the 
+        # heap.
+        self.sm_buf = array.array('H',[0])
+        self.angle_offset : int = 0
+        self.num_pole_pairs : int = 0
+
+        self.drive_offset :int = 1024
+        self.a_was_down : bool = False
+
+        self.invl : int = 0
+
+    def calibrate(self):
+        self.angle_offset, self.num_pole_pairs = full_calibration()
+        sm1.get(self.sm_buf)
+        invl = 0xffff - self.sm_buf[0]
+
+    @micropython.native
+    def update(self):
         while 1:
-            sm0.get(sm_buf)
+            sm0.get(self.sm_buf)
             if sm0.rx_fifo() == 0:
                 break
-        high = 0xffff - sm_buf[0] 
+        high = 0xffff - self.sm_buf[0] 
 
         while sm1.rx_fifo() > 0:
-            sm1.get(sm_buf)
-            invl = 0xffff - sm_buf[0]
+            sm1.get(self.sm_buf)
+            self.invl = 0xffff - self.sm_buf[0]
 
         pin_debug.on()
-        duty = high*4119//invl - 15
+        duty = high*4119//self.invl - 15
         # TODO: <16 means "error"
         if duty < 0:
             duty = 0
         if duty > 4095:
             duty = 0
 
-        pole_angle = clamp_angle(duty * num_pole_pairs + angle_offset)
+        pole_angle = clamp_angle(duty * self.num_pole_pairs + self.angle_offset)
         
-        drive_angle = pole_angle + drive_offset
+        drive_angle = pole_angle + self.drive_offset
         if drive_angle < 0:
             drive_angle += 4096
         drive_angle = drive_angle % 4096
@@ -243,11 +250,27 @@ def run():
         pin_debug.off()
 
         if yukon.is_pressed("A"):
-            if not a_was_down:
-                drive_offset = 4096-drive_offset
+            if not self.a_was_down:
+                drive_offset = 4096-self.drive_offset
                 a_was_down = True
         else:
             a_was_down = False
+
+@micropython.native
+def run():
+    yukon.enable_main_output()
+    
+    motor = Motor()
+    motor.calibrate()
+
+    sm_buf = array.array('H',[0])
+
+    drive_offset = 1024
+    a_was_down = False
+    
+    while not yukon.is_boot_pressed():
+        motor.update()
+        
 
 try:
     run()
