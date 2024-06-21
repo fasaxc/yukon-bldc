@@ -11,12 +11,14 @@ from pimoroni_yukon import Yukon
 
 @rp2.asm_pio()
 def measure_high_time():
+    # Wait for a LOW.
+    wait(0, pin, 0)
+    # Wait for a HIGH.
+    wait(1, pin, 0)
+
     wrap_target()
     # x = 0xffffffff
     mov(x, invert(null))
-
-    # Wait for a HIGH.
-    wait(1, pin, 0)
 
     label("high_loop")
     jmp(x_dec, "cont_high_loop")
@@ -25,6 +27,8 @@ def measure_high_time():
     jmp(pin, "high_loop")
 
     mov(isr, x)
+    # Wait for a HIGH before we push to avoid jitter.
+    wait(1, pin, 0)
     push(noblock)
 
     wrap()
