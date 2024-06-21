@@ -1,11 +1,14 @@
+import micropython
+micropython.alloc_emergency_exception_buf(100)
+
 import array
 import math
 import time
 import machine
 from machine import Pin, PWM
-import micropython
-import rp2
+import random
 import gc
+import rp2
 from pimoroni_yukon import Yukon
 
 
@@ -205,6 +208,9 @@ def full_calibration():
     return angle_offset, num_pole_pairs
 
 
+stop = False
+
+
 class Motor:
     def __init__(self) -> None:
         # Using a 16-bit array so that StateMachine.get() discards the 
@@ -225,40 +231,36 @@ class Motor:
         invl = 0xffff - self.sm_buf[0]
 
     @micropython.native
-    def update(self):
-        while 1:
+    def update(self, pio):
+        try:
+            pin_debug.on()
             sm0.get(self.sm_buf)
-            if sm0.rx_fifo() == 0:
-                break
-        high = 0xffff - self.sm_buf[0] 
+            high = 0xffff - self.sm_buf[0] 
 
-        while sm1.rx_fifo() > 0:
-            sm1.get(self.sm_buf)
-            self.invl = 0xffff - self.sm_buf[0]
+            if sm1.rx_fifo() > 0:
+                sm1.get(self.sm_buf)
+                self.invl = 0xffff - self.sm_buf[0]
 
-        pin_debug.on()
-        duty = high*4119//self.invl - 15
-        # TODO: <16 means "error"
-        if duty < 0:
-            duty = 0
-        if duty > 4095:
-            duty = 0
+            duty = high*4119//self.invl - 15
+            # TODO: <16 means "error"
+            if duty < 0:
+                duty = 0
+            if duty > 4095:
+                duty = 0
 
-        pole_angle = clamp_angle(duty * self.num_pole_pairs + self.angle_offset)
-        
-        drive_angle = pole_angle + self.drive_offset
-        if drive_angle < 0:
-            drive_angle += 4096
-        drive_angle = drive_angle % 4096
-        set_duty(drive_angle, 1024)
-        pin_debug.off()
+            pole_angle = clamp_angle(duty * self.num_pole_pairs + self.angle_offset)
+            
+            drive_angle = pole_angle + self.drive_offset
+            if drive_angle < 0:
+                drive_angle += 4096
+            drive_angle = drive_angle % 4096
+            set_duty(drive_angle, 1024)
+        except BaseException:
+            global stop 
+            stop = True
+        finally:
+            pin_debug.off()
 
-        if yukon.is_pressed("A"):
-            if not self.a_was_down:
-                drive_offset = 4096-self.drive_offset
-                a_was_down = True
-        else:
-            a_was_down = False
 
 @micropython.native
 def run():
@@ -271,10 +273,36 @@ def run():
 
     drive_offset = 1024
     a_was_down = False
-    
-    while not yukon.is_boot_pressed():
-        motor.update()
+
+    try:
+        INTR_SM0_RXNEMPTY = 0x001
+        rp2.PIO(0).irq(motor.update, trigger=INTR_SM0_RXNEMPTY, hard=True)
         
+        while True:
+            # yukon.is_boot_pressed() gives spurious readings while
+            # the interrupt handler is running.  Need to debug!
+            #s = machine.disable_irq()
+            bp = yukon.is_boot_pressed()
+            ap = yukon.is_pressed("A")
+            #machine.enable_irq(s)
+
+            if ap and not a_was_down:
+                motor.drive_offset = 4096 - motor.drive_offset
+                a_was_down = True
+            elif not ap:
+                a_was_down = False
+            if bp:
+                print("Boot pressed, stopping")
+                break
+            if stop:
+                print("Interrupt in IRQ, stopping")
+                break
+            print("Random:", random.random())
+            print("Alloc:", gc.mem_alloc())
+            gc.collect()
+    finally:
+        print("Shutting down")
+        rp2.PIO(0).irq(None)
 
 try:
     run()
