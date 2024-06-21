@@ -221,7 +221,7 @@ class Motor:
         self.num_pole_pairs : int = 0
 
         self.drive_offset :int = 1024
-        self.a_was_down : bool = False
+        self.a_was_pressed : bool = False
 
         self.invl : int = 0
 
@@ -272,31 +272,31 @@ def run():
     sm_buf = array.array('H',[0])
 
     drive_offset = 1024
-    a_was_down = False
+    a_was_pressed = False
 
     try:
         INTR_SM0_RXNEMPTY = 0x001
         rp2.PIO(0).irq(motor.update, trigger=INTR_SM0_RXNEMPTY, hard=True)
         
         while True:
-            # yukon.is_boot_pressed() gives spurious readings while
-            # the interrupt handler is running.  Need to debug!
-            #s = machine.disable_irq()
-            bp = yukon.is_boot_pressed()
-            ap = yukon.is_pressed("A")
-            #machine.enable_irq(s)
-
-            if ap and not a_was_down:
-                motor.drive_offset = 4096 - motor.drive_offset
-                a_was_down = True
-            elif not ap:
-                a_was_down = False
-            if bp:
-                print("Boot pressed, stopping")
-                break
             if stop:
                 print("Interrupt in IRQ, stopping")
                 break
+
+            boot_pressed = yukon.is_boot_pressed()
+            if boot_pressed:
+                print("Boot pressed, stopping")
+                break
+
+            a_pressed = yukon.is_pressed("A")
+            if a_pressed and not a_was_pressed:
+                motor.drive_offset = 4096 - motor.drive_offset
+                a_was_pressed = True
+            elif not a_pressed:
+                a_was_pressed = False
+                
+            # Do some float operations and GC to prove that the IRQ is
+            # decoupled from the main loop.
             print("Random:", random.random())
             print("Alloc:", gc.mem_alloc())
             gc.collect()
