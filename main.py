@@ -12,10 +12,44 @@ import rp2
 from pimoroni_yukon import Yukon
 
 
-@rp2.asm_pio()
+# PIO program to read a PWM signal on its input pin
+# Requires the single input pin to be mapped to both 
+# its IN pin and its JMP pin.
+#
+# Output is 32 bits encoding the high time and the 
+# interval.  The high time is in the most significant
+# 16 bits; the interval is in the least significant 16
+# bits.  The values are encoded as 0xffff - value.
+@rp2.asm_pio(push_thresh=32, autopush=True)
+def pio_read_pwm():
+    wrap_target()                # while (1) {             # type: ignore
+
+    mov(x, invert(null))         #   x = 0xffffffff        # type: ignore
+    
+    label("loop_high")           #   do {                  # type: ignore
+    jmp(x_dec, "xdec1")          #     x--                 # type: ignore
+    label("xdec1")               #                         # type: ignore
+    nop()                        #                         # type: ignore
+    jmp(pin, "loop_high")        #   } while (pin high) # type: ignore
+    
+    in_(x, 16)                   #   ISR = (ISR << 16) | (X & 0xffff) # type: ignore
+
+    label("loop_low")            #   do {                  # type:ignore 
+    jmp(x_dec, "xdec2")          #     x--                 # type:ignore
+    label("xdec2")               #                         # type:ignore
+    jmp(pin, "exit_loop_low")    #     if (pin high) break # type:ignore
+    jmp("loop_low")              #   } while (1)           # type:ignore
+    label("exit_loop_low")       #                         # type:ignore
+
+    in_(x, 16)                   #   ISR = (ISR << 16) | (X & 0xffff) # type: ignore
+    
+    wrap()                       # }                       # type:ignore           
+    
+    
+rp2.asm_pio()
 def measure_high_time():
     # Wait for a LOW.
-    wait(0, pin, 0)
+    wait(0, pin, 0) 
     # Wait for a HIGH.
     wait(1, pin, 0)
 
