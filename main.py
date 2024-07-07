@@ -44,70 +44,19 @@ def pio_read_pwm():
     in_(x, 16)                   #   ISR = (ISR << 16) | (X & 0xffff) # type: ignore
     
     wrap()                       # }                       # type:ignore           
-    
-    
-rp2.asm_pio()
-def measure_high_time():
-    # Wait for a LOW.
-    wait(0, pin, 0) 
-    # Wait for a HIGH.
-    wait(1, pin, 0)
-
-    wrap_target()
-    # x = 0xffffffff
-    mov(x, invert(null))
-
-    label("high_loop")
-    jmp(x_dec, "cont_high_loop")
-    label("cont_high_loop")
-    nop()
-    jmp(pin, "high_loop")
-
-    mov(isr, x)
-    # Wait for a HIGH before we push to avoid jitter.
-    wait(1, pin, 0)
-    push(noblock)
-
-    wrap()
-
-@rp2.asm_pio()
-def measure_interval():
-    wrap_target()
-
-    # x = 0xffffffff
-    mov(x, invert(null))
-
-    # Wait for LOW->HIGH transition.
-    wait(0, pin, 0)
-    wait(1, pin, 0)
-
-    label("loop_while_high")
-    jmp(x_dec, "cont_loop_while_high")
-    label("cont_loop_while_high")
-    nop()
-    jmp(pin, "loop_while_high")
-
-    label("loop_while_low")
-    jmp(x_dec, "cont_loop_while_low")
-    label("cont_loop_while_low")
-    jmp(pin, "send")
-    jmp("loop_while_low")
-
-    label("send")
-    mov(isr, x)
-    push(noblock)
-
-    wrap()
 
 
 pin_sensor = Pin(23, Pin.IN, Pin.PULL_UP)
-sm0 = rp2.StateMachine(0, measure_high_time, freq=125_000_000,  in_base=pin_sensor, jmp_pin=pin_sensor)
-sm1 = rp2.StateMachine(4, measure_interval, freq=125_000_000, in_base=pin_sensor, jmp_pin=pin_sensor)
+pwm_sm = rp2.StateMachine(
+    0, 
+    pio_read_pwm, 
+    freq=125_000_000,  
+    in_base=pin_sensor, 
+    jmp_pin=pin_sensor,
+)
 
 # Start the StateMachine's running.
-sm0.active(1)
-sm1.active(1)
-
+pwm_sm.active(1)
 
 pin_debug = Pin(26, Pin.OUT)
 
@@ -162,22 +111,41 @@ lut = array.array('H', [
     ) for i in range(lut_len)])
 
 
-def read_pwm_slow():
-    sm_buf = array.array('H',[0])
-    while 1:
-        sm0.get(sm_buf)
-        if sm0.rx_fifo() == 0:
-            sm0.get(sm_buf)
-            break
-    high = 0xffff - sm_buf[0] 
+_read_pwm_block_read_buf=array.array("i", [0])
+@micropython.viper
+def read_pwm_block(pwm_sm, out_buf:ptr32): # type:ignore
+    """Read a fresh value from the PWM FIFO.
 
+    Detects FIFO overflow and resyncs with the PWM signal 
+    if needed (this takes 2-3 PWM cycles).
+    
+    To avoid allocations, the values are returned via
+    the out_buf in the order high, interval.
+    """
+
+    # Check if we need to handle a FIFO overflow.
+    overflow = int(pwm_sm.rx_fifo()) == 4
+    # Drain the FIFO.
     while 1:
-        sm1.get(sm_buf)
-        if sm1.rx_fifo() == 0:
-            sm1.get(sm_buf)
+        pwm_sm.get(_read_pwm_block_read_buf)
+        if int(pwm_sm.rx_fifo()) == 0:
             break
-    invl = 0xffff - sm_buf[0]
-    return high, invl
+    if overflow:
+        # If FIFO overflowed, then the next value will
+        # be garbage because the PIO program blocks and 
+        # restarts at a random point of a PWM cycle.
+        # Read another couple of values to get back in 
+        # sync.
+        pwm_sm.get(_read_pwm_block_read_buf)
+        pwm_sm.get(_read_pwm_block_read_buf)
+
+    buf_ptr = ptr16(_read_pwm_block_read_buf)  # type: ignore
+    high = 0xffff - buf_ptr[1]
+    invl = 0xffff - buf_ptr[0]
+    # Return via the provided buffer because returning 32
+    # bits or a tuple would allocate.
+    out_buf[0] = high
+    out_buf[1] = invl
 
 
 @micropython.viper
@@ -210,7 +178,10 @@ def full_calibration():
         pin_debug.off()
         
     time.sleep_ms(500) # Let rotor settle.
-    high, invl = read_pwm_slow()
+
+    pwm_buf = array.array("H", [0] * 2)
+    read_pwm_block(pwm_sm, pwm_buf)
+    high, invl = pwm_buf
     angle1 = clamp_angle(high*4096//invl)
     print("Calibration interval A = {} / {} = {} = {}".format(high, invl, angle1, angle1*360/4096))
 
@@ -222,7 +193,8 @@ def full_calibration():
         pin_debug.off()
         
     time.sleep_ms(500) # Let rotor settle.
-    high2, invl2 = read_pwm_slow()
+    read_pwm_block(pwm_sm, pwm_buf)
+    high2, invl2 = pwm_buf
     angle2 = clamp_angle(high2*4096//invl2)
     print("Calibration interval B = {} / {} = {} = {}".format(high2, invl2, angle2, angle2*360/4096))
     delta = clamp_angle(angle2-angle1)
@@ -244,7 +216,6 @@ def full_calibration():
 
 stop = False
 
-
 class Motor:
     def __init__(self) -> None:
         # Using a 16-bit array so that StateMachine.get() discards the 
@@ -262,13 +233,12 @@ class Motor:
     def calibrate(self):
         self.angle_offset, self.num_pole_pairs = full_calibration()
         sm1.get(self.sm_buf)
-        invl = 0xffff - self.sm_buf[0]
 
     @micropython.native
     def update(self, pio):
         try:
             pin_debug.on()
-            sm0.get(self.sm_buf)
+            pwm_sm.get(self.sm_buf)
             high = 0xffff - self.sm_buf[0] 
 
             if sm1.rx_fifo() > 0:
@@ -299,6 +269,11 @@ class Motor:
 @micropython.native
 def run():
     yukon.enable_main_output()
+
+    buf = array.array("i", [0,0])
+    while True:
+        read_pwm_block(pwm_sm, buf)
+        print(buf[0], buf[1], gc.mem_alloc())
     
     motor = Motor()
     motor.calibrate()
@@ -309,8 +284,8 @@ def run():
     a_was_pressed = False
 
     try:
-        INTR_SM0_RXNEMPTY = 0x001
-        rp2.PIO(0).irq(motor.update, trigger=INTR_SM0_RXNEMPTY, hard=True)
+        INTR_pwm_sm_RXNEMPTY = 0x001
+        rp2.PIO(0).irq(motor.update, trigger=INTR_pwm_sm_RXNEMPTY, hard=True)
         
         while True:
             if stop:
