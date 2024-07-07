@@ -150,18 +150,21 @@ def read_pwm_block(pwm_sm, out_buf:ptr32): # type:ignore
 
 @micropython.viper
 def set_duty(angle : int, power : int):
-    angle = angle % 4096
-    pwms[0].duty_u16(int(lut[angle]) * power // 4096)
-    angle2 = (angle+(4096 // 3))%4096
-    pwms[1].duty_u16(int(lut[angle2]) * power // 4096)
-    pwms[2].duty_u16(int(lut[(angle+(2 *4096 // 3))%4096]) * power // 4096)
+    lut_ptr = ptr16(lut)
+    angle = angle & 0xfff
+    pwms[0].duty_u16((lut_ptr[angle] * power) >> 12)
+    angle2 = (angle+1365) & 0xfff
+    pwms[1].duty_u16((lut_ptr[angle2] * power) >> 12)
+    angle3 = (angle+2731) & 0xfff
+    pwms[2].duty_u16((lut_ptr[angle3] * power) >> 12)
 
 
-def clamp_angle(angle):
+@micropython.viper
+def clamp_angle(angle:int) -> int:
     angle = angle % 4096
-    while angle >= 2048:
+    if angle >= 2048:
         angle -= 4096
-    while angle < -2048:
+    elif angle < -2048:
         angle += 4096
     return angle
 
@@ -259,17 +262,13 @@ class Motor:
             angle = 0
         return angle
 
-    @micropython.native
+    @micropython.viper
     def update(self, pio):
         try:
             pin_debug.on()
-            duty = self._read_pwm()
-            pole_angle = clamp_angle(duty * self.num_pole_pairs + self.angle_offset)
-            
-            drive_angle = pole_angle + self.drive_offset
-            if drive_angle < 0:
-                drive_angle += 4096
-            drive_angle = drive_angle % 4096
+            duty : int = int(self._read_pwm())
+            pole_angle : int = duty * int(self.num_pole_pairs) + int(self.angle_offset)
+            drive_angle : int = pole_angle + int(self.drive_offset)
             set_duty(drive_angle, 1024)
         except BaseException:
             global stop 
