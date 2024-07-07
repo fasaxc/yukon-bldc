@@ -1,5 +1,5 @@
 import micropython
-micropython.alloc_emergency_exception_buf(100)
+micropython.alloc_emergency_exception_buf(1000)
 
 import array
 import math
@@ -179,9 +179,10 @@ def full_calibration():
         
     time.sleep_ms(500) # Let rotor settle.
 
-    pwm_buf = array.array("H", [0] * 2)
+    pwm_buf = array.array("I", [0] * 2)
     read_pwm_block(pwm_sm, pwm_buf)
-    high, invl = pwm_buf
+    high = pwm_buf[0]
+    invl = pwm_buf[1]
     angle1 = clamp_angle(high*4096//invl)
     print("Calibration interval A = {} / {} = {} = {}".format(high, invl, angle1, angle1*360/4096))
 
@@ -194,7 +195,8 @@ def full_calibration():
         
     time.sleep_ms(500) # Let rotor settle.
     read_pwm_block(pwm_sm, pwm_buf)
-    high2, invl2 = pwm_buf
+    high2 = pwm_buf[0]
+    invl2 = pwm_buf[1]
     angle2 = clamp_angle(high2*4096//invl2)
     print("Calibration interval B = {} / {} = {} = {}".format(high2, invl2, angle2, angle2*360/4096))
     delta = clamp_angle(angle2-angle1)
@@ -218,40 +220,49 @@ stop = False
 
 class Motor:
     def __init__(self) -> None:
-        # Using a 16-bit array so that StateMachine.get() discards the 
-        # top 16 bits, which prevents our value from spilling to the 
-        # heap.
-        self.sm_buf = array.array('H',[0])
+        # Pre-allocated buffer for use by ISR.
+        self.sm_buf = array.array('i',[0, 0])
+
         self.angle_offset : int = 0
         self.num_pole_pairs : int = 0
 
         self.drive_offset :int = 1024
         self.a_was_pressed : bool = False
 
-        self.invl : int = 0
-
     def calibrate(self):
         self.angle_offset, self.num_pole_pairs = full_calibration()
-        sm1.get(self.sm_buf)
+
+    @micropython.viper
+    def _read_pwm(self) -> int:
+        """Read next value from the PWM FIFO.
+        
+        Returns the wheel angle in 4096ths.
+        """
+
+        # FIXME Hard coded to read SM0's FIFO
+        # pwm.get() misbehaves here; takes almost 1ms to return
+        # as if FIFO has already been drained? 
+        fifo = ptr32(0x50200020) 
+        ptr32(self.sm_buf)[0] = fifo[0]
+        
+        # Data is actually two 16-bit counters packed into
+        # a 32-bit word.
+        buf_ptr = ptr16(self.sm_buf)  # type: ignore
+        high = 0xffff - buf_ptr[1]
+        invl = 0xffff - buf_ptr[0]
+        angle = high*4119//invl - 15
+        # TODO: <16 means "error"
+        if angle < 0:
+            angle = 0
+        if angle > 4095:
+            angle = 0
+        return angle
 
     @micropython.native
     def update(self, pio):
         try:
             pin_debug.on()
-            pwm_sm.get(self.sm_buf)
-            high = 0xffff - self.sm_buf[0] 
-
-            if sm1.rx_fifo() > 0:
-                sm1.get(self.sm_buf)
-                self.invl = 0xffff - self.sm_buf[0]
-
-            duty = high*4119//self.invl - 15
-            # TODO: <16 means "error"
-            if duty < 0:
-                duty = 0
-            if duty > 4095:
-                duty = 0
-
+            duty = self._read_pwm()
             pole_angle = clamp_angle(duty * self.num_pole_pairs + self.angle_offset)
             
             drive_angle = pole_angle + self.drive_offset
@@ -269,11 +280,6 @@ class Motor:
 @micropython.native
 def run():
     yukon.enable_main_output()
-
-    buf = array.array("i", [0,0])
-    while True:
-        read_pwm_block(pwm_sm, buf)
-        print(buf[0], buf[1], gc.mem_alloc())
     
     motor = Motor()
     motor.calibrate()
@@ -284,8 +290,8 @@ def run():
     a_was_pressed = False
 
     try:
-        INTR_pwm_sm_RXNEMPTY = 0x001
-        rp2.PIO(0).irq(motor.update, trigger=INTR_pwm_sm_RXNEMPTY, hard=True)
+        INTR_SM0_RXNEMPTY = 0x001
+        rp2.PIO(0).irq(motor.update, trigger=INTR_SM0_RXNEMPTY, hard=True)
         
         while True:
             if stop:
@@ -306,8 +312,8 @@ def run():
                 
             # Do some float operations and GC to prove that the IRQ is
             # decoupled from the main loop.
-            print("Random:", random.random())
-            print("Alloc:", gc.mem_alloc())
+            #print("Random:", random.random())
+            #print("Alloc:", gc.mem_alloc())
             gc.collect()
     finally:
         print("Shutting down")
