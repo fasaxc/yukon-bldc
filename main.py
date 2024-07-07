@@ -284,12 +284,11 @@ def run():
     motor = Motor()
     motor.calibrate()
 
-    sm_buf = array.array('H',[0])
-
     drive_offset = 1024
     a_was_pressed = False
 
     try:
+        # Attach interrupt handler to the "FIFO has data" interrupt. 
         INTR_SM0_RXNEMPTY = 0x001
         rp2.PIO(0).irq(motor.update, trigger=INTR_SM0_RXNEMPTY, hard=True)
         
