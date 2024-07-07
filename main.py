@@ -243,13 +243,14 @@ class Motor:
         # pwm.get() misbehaves here; takes almost 1ms to return
         # as if FIFO has already been drained? 
         fifo = ptr32(0x50200020) 
-        ptr32(self.sm_buf)[0] = fifo[0]
+        buf_ptr = ptr32(self.sm_buf)
+        buf_ptr[0] = fifo[0]
         
         # Data is actually two 16-bit counters packed into
         # a 32-bit word.
-        buf_ptr = ptr16(self.sm_buf)  # type: ignore
-        high = 0xffff - buf_ptr[1]
-        invl = 0xffff - buf_ptr[0]
+        buf_ptr16 = ptr16(buf_ptr)  # type: ignore
+        invl = 0xffff - buf_ptr16[0]
+        high = 0xffff - buf_ptr16[1]
         angle = high*4119//invl - 15
         # TODO: <16 means "error"
         if angle < 0:
