@@ -110,7 +110,6 @@ lut = array.array('H', [
         65535
     ) for i in range(lut_len)])
 
-
 _read_pwm_block_read_buf=array.array("i", [0])
 @micropython.viper
 def read_pwm_block(pwm_sm, out_buf:ptr32): # type:ignore
@@ -224,7 +223,7 @@ stop = False
 class Motor:
     def __init__(self) -> None:
         # Pre-allocated buffer for use by ISR.
-        self.sm_buf = array.array('i',[0, 0])
+        self.sm_buf = array.array('i',[0])
 
         self.angle_offset : int = 0
         self.num_pole_pairs : int = 0
@@ -251,7 +250,7 @@ class Motor:
         
         # Data is actually two 16-bit counters packed into
         # a 32-bit word.
-        buf_ptr16 = ptr16(buf_ptr)  # type: ignore
+        buf_ptr16 = ptr16(self.sm_buf)  # type: ignore
         invl = 0xffff - buf_ptr16[0]
         high = 0xffff - buf_ptr16[1]
         angle = high*4119//invl - 15
@@ -264,17 +263,49 @@ class Motor:
 
     @micropython.viper
     def update(self, pio):
+        pin_debug.on()
         try:
-            pin_debug.on()
-            duty : int = int(self._read_pwm())
-            pole_angle : int = duty * int(self.num_pole_pairs) + int(self.angle_offset)
+            fifo = ptr32(0x50200020) 
+            buf_ptr = ptr32(self.sm_buf)
+            buf_ptr[0] = fifo[0]    
+        
+            # Data is actually two 16-bit counters packed into
+            # a 32-bit word.
+            buf_ptr16 = ptr16(self.sm_buf)  # type: ignore
+            invl = 0xffff - buf_ptr16[0]
+            high = 0xffff - buf_ptr16[1]
+            angle = high*4119//invl - 15
+            # TODO: <16 means "error"
+            if angle < 0:
+                angle = 0
+            if angle > 4095:
+                angle = 0
+            
+            pole_angle : int = angle * int(self.num_pole_pairs) + int(self.angle_offset)
             drive_angle : int = pole_angle + int(self.drive_offset)
-            set_duty(drive_angle, 1024)
+
+            power = 1024
+            lut_ptr = ptr16(lut)
+            tap1 = drive_angle & 0xfff
+            tap2 = (drive_angle+1365) & 0xfff
+            tap3 = (drive_angle+2731) & 0xfff
+            duty1 = (lut_ptr[tap1] * power) >> 18 # Extra shift of 6 for PWM TOP scale.
+            duty2 = (lut_ptr[tap2] * power) >> 18
+            duty3 = (lut_ptr[tap3] * power) >> 18
+
+            # 20 = 2A 0x40050034 LSB
+            # 21 = 2B            MSB
+            # 22 = 3A 0x40050048
+            ptr32(0x40050034)[0] = duty1 | (duty2<<16)
+            ptr32(0x40050048)[0] = duty3
+            
+            # pwms[0].duty_u16(duty1)
+            # pwms[1].duty_u16(duty2)
+            # pwms[2].duty_u16(duty3)
         except BaseException:
             global stop 
             stop = True
-        finally:
-            pin_debug.off()
+        pin_debug.off()
 
 
 @micropython.native
