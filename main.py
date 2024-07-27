@@ -240,19 +240,16 @@ class Motor:
         
         Returns the wheel angle in 4096ths.
         """
-
         # FIXME Hard coded to read SM0's FIFO
-        # pwm.get() misbehaves here; takes almost 1ms to return
-        # as if FIFO has already been drained? 
-        fifo = ptr32(0x50200020) 
-        buf_ptr = ptr32(self.sm_buf)
-        buf_ptr[0] = fifo[0]
-        
+        fifo = ptr32(0x50200020)    
+    
         # Data is actually two 16-bit counters packed into
         # a 32-bit word.
-        buf_ptr16 = ptr16(self.sm_buf)  # type: ignore
-        invl = 0xffff - buf_ptr16[0]
-        high = 0xffff - buf_ptr16[1]
+        packed_value = fifo[0]
+        raw_invl = packed_value & 0xffff
+        raw_high = (packed_value >> 16) & 0xffff
+        invl = 0xffff - raw_invl
+        high = 0xffff - raw_high
         angle = high*4119//invl - 15
         # TODO: <16 means "error"
         if angle < 0:
@@ -265,15 +262,16 @@ class Motor:
     def update(self, pio):
         pin_debug.on()
         try:
-            fifo = ptr32(0x50200020) 
-            buf_ptr = ptr32(self.sm_buf)
-            buf_ptr[0] = fifo[0]    
+            # FIXME Hard coded to read SM0's FIFO
+            fifo = ptr32(0x50200020)    
         
             # Data is actually two 16-bit counters packed into
             # a 32-bit word.
-            buf_ptr16 = ptr16(self.sm_buf)  # type: ignore
-            invl = 0xffff - buf_ptr16[0]
-            high = 0xffff - buf_ptr16[1]
+            packed_value = fifo[0]
+            raw_invl = packed_value & 0xffff
+            raw_high = (packed_value >> 16) & 0xffff
+            invl = 0xffff - raw_invl
+            high = 0xffff - raw_high
             angle = high*4119//invl - 15
             # TODO: <16 means "error"
             if angle < 0:
@@ -293,15 +291,17 @@ class Motor:
             duty2 = (lut_ptr[tap2] * power) >> 18
             duty3 = (lut_ptr[tap3] * power) >> 18
 
+            # Want to do this but each method call costs 10us, which
+            # is far too much.
+            # pwms[0].duty_u16(duty1)
+            # pwms[1].duty_u16(duty2)
+            # pwms[2].duty_u16(duty3)
+
             # 20 = 2A 0x40050034 LSB
             # 21 = 2B            MSB
             # 22 = 3A 0x40050048
             ptr32(0x40050034)[0] = duty1 | (duty2<<16)
             ptr32(0x40050048)[0] = duty3
-            
-            # pwms[0].duty_u16(duty1)
-            # pwms[1].duty_u16(duty2)
-            # pwms[2].duty_u16(duty3)
         except BaseException:
             global stop 
             stop = True
@@ -357,3 +357,4 @@ finally:
     for pwm in pwms:
         pwm.duty_u16(0)
     yukon.reset()
+    gc.collect()
