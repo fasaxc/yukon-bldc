@@ -352,6 +352,8 @@ def run():
         a_was_pressed = False
 
         # Attach interrupt handler to the "FIFO has data" interrupt.
+        # FIXME Move interrupt setup to class
+        # FIXME Can this handle multiple ISRs for different hooks?
         INTR_SM0_RXNEMPTY = 0x001
         rp2.PIO(0).irq(motor.update, trigger=INTR_SM0_RXNEMPTY, hard=True)
 
