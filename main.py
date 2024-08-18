@@ -3,6 +3,7 @@ import micropython
 micropython.alloc_emergency_exception_buf(1000)
 
 import array
+from uctypes import addressof
 import math
 import time
 import machine
@@ -86,21 +87,13 @@ class Motor:
         )
         self._sensor_sm.active(1)
 
-        # Calibration values.
-        self.angle_offset: int = 0
-        self.num_pole_pairs: int = 0
-
-        # Pole angle at which we drive the coils vs the rotor position.
-        # 1024 = +90 degrees
-        # 3072 = -90 degrees
-        self.drive_offset: int = 1024
-
         # DMA
         # Calculate RX FIFO DREQ number.
         dreq_idx = pio_dreq_base + (pio_sm_num % 4)
         print("SM=", pio_sm_num, "dreq=", dreq_idx)
 
-        self._dma_target = array.array("I", [0, 0])
+        self._set_up_isr_vars()
+
         self._sm_dma = rp2.DMA()
         self._time_dma = rp2.DMA()
 
@@ -112,7 +105,7 @@ class Motor:
         )
         self._time_dma.config(
             read=0x40054000 + 0x28,  # TIMERAWL
-            write=memoryview(self._dma_target)[1:],
+            write=self._dma_target[1:],
             count=1,
             ctrl=c,
             trigger=False,
@@ -128,7 +121,7 @@ class Motor:
         )
         self._sm_dma.config(
             read=self._sensor_sm,  # RX FIFO
-            write=self._dma_target,
+            write=self._dma_target[:1],
             count=1,
             ctrl=c,
             trigger=True,
@@ -192,6 +185,7 @@ class Motor:
         machine.mem32[pwm_en_set] = pwm_en_mask
 
     def calibrate(self):
+        # TODO: handle incorrect rotation direction.
         # Calibration: rotate by a quarter phase to capture the rotor.
         # Seems to be a good angle to read off the angle offset.  Maybe
         # because the first duty is at 100%?
@@ -255,6 +249,7 @@ class Motor:
         while True:
             packed_value, time = self._dma_target
             if time != start_time:
+                # New value arrived.
                 break
 
         # Data is actually two 16-bit counters packed into
@@ -284,13 +279,65 @@ class Motor:
         self._time_dma.close()
         self._sm_dma.close()
 
+    @property
+    def num_pole_pairs(self) -> int:
+        return self._isr_backing_arr[4]
+
+    @num_pole_pairs.setter
+    def num_pole_pairs(self, value: int):
+        self._isr_backing_arr[4] = value
+
+    @property
+    def angle_offset(self) -> int:
+        return self._isr_backing_arr[5]
+
+    @angle_offset.setter
+    def angle_offset(self, value: int):
+        self._isr_backing_arr[5] = value
+
+    @property
+    def drive_offset(self) -> int:
+        return self._isr_backing_arr[6]
+
+    @drive_offset.setter
+    def drive_offset(self, value: int):
+        self._isr_backing_arr[6] = value
+
+    def _set_up_isr_vars(self):
+        # Access to self._anything is slow for the ISR.  Put all the
+        # fields needed by the ISR into an array so that we can look
+        # up its address exactly once and then do fast memory-access.
+        self._isr_backing_arr = array.array(
+            "I",
+            [
+                0,  # 0 = DMA'd sensor value
+                0,  # 1 = DMA timstamp
+                0,  # 2 = last processed value
+                0,  # 3 = last processed timestamp
+                0,  # 4 = num pole pairs
+                0,  # 5 = angle offset
+                1024,  # 6 = drive offset
+                addressof(self._lut),  # 7 = ptr16(self._lut)
+                self._pwm_duty_addrs[0],  # 8 = duty_addrs[0]
+                self._pwm_duty_addrs[1],  # 9 = duty_addrs[1]
+            ],
+        )
+        self._isr_vars = memoryview(self._isr_backing_arr)
+        self._dma_target = self._isr_vars[:2]
+        self._isr_vars_addr = addressof(self._isr_backing_arr)
+
     @micropython.viper
     def update(self, dma):
         pin_debug.on()
         try:
+            # Access ISR state variables through a single pointer
+            # to keep overheads low.  Unfortunately, Viper doesn't
+            # support const() so we can't name our indexes.
+            vars = ptr32(self._isr_vars_addr)
+
             # Data is actually two 16-bit counters packed into
             # a 32-bit word.
-            packed_value = ptr32(self._dma_target)[0]
+            packed_value = vars[0]
             raw_invl = packed_value & 0xFFFF
             raw_high = (packed_value >> 16) & 0xFFFF
             invl = 0xFFFF - raw_invl
@@ -302,11 +349,14 @@ class Motor:
             if angle > 4095:
                 angle = 0
 
-            pole_angle: int = angle * int(self.num_pole_pairs) + int(self.angle_offset)
-            drive_angle: int = pole_angle + int(self.drive_offset)
+            num_pole_pairs = vars[4]
+            angle_offset = vars[5]
+            pole_angle: int = angle * num_pole_pairs + angle_offset
+            drive_offset = vars[6]
+            drive_angle: int = pole_angle + drive_offset
 
             power = 1024
-            lut_ptr = ptr16(self._lut)
+            lut_ptr = ptr16(vars[7])
             tap1 = drive_angle & 0xFFF
             tap2 = (drive_angle + 1365) & 0xFFF
             tap3 = (drive_angle + 2731) & 0xFFF
@@ -323,9 +373,10 @@ class Motor:
             # 20 = 2A 0x40050034 LSB
             # 21 = 2B            MSB
             # 22 = 3A 0x40050048
-            duty_addrs = ptr32(self._pwm_duty_addrs)
-            ptr32(duty_addrs[0])[0] = duty1 | (duty2 << 16)
-            ptr32(duty_addrs[1])[0] = duty3
+            duty_reg_addr = ptr32(vars[8])
+            duty_reg_addr[0] = duty1 | (duty2 << 16)
+            duty_reg_addr = ptr32(vars[9])
+            duty_reg_addr[0] = duty3
         except BaseException:
             global stop
             stop = True
@@ -402,13 +453,13 @@ def run():
 
             a_pressed = yukon.is_pressed("A")
             if a_pressed and not a_was_pressed:
+                print("Switch direction")
                 motor.drive_offset = 4096 - motor.drive_offset
                 a_was_pressed = True
             elif not a_pressed:
                 a_was_pressed = False
 
-            time.sleep_ms(1000)
-            print("Main loop...")
+            time.sleep_ms(1)
     finally:
         print("Shutting down")
         motor.stop()
