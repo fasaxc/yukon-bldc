@@ -488,16 +488,16 @@ def run():
 
             a_pressed = yukon.is_pressed("A")
             if a_pressed and not a_was_pressed:
-                print("Decrease power")
                 motor.drive_power -= 100
+                print("Decrease power", motor.drive_power)
                 a_was_pressed = True
             elif not a_pressed:
                 a_was_pressed = False
 
             b_pressed = yukon.is_pressed("B")
             if b_pressed and not b_was_pressed:
-                print("Increase power")
                 motor.drive_power += 100
+                print("Increase power", motor.drive_power)
                 b_was_pressed = True
             elif not b_pressed:
                 b_was_pressed = False
@@ -517,4 +517,5 @@ try:
 
 finally:
     # Put the board back into a safe state, regardless of how the program may have ended
+    yukon.reset()
     gc.collect()
