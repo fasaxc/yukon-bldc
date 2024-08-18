@@ -303,6 +303,20 @@ class Motor:
     def drive_offset(self, value: int):
         self._isr_backing_arr[6] = value
 
+    @property
+    def speed(self) -> int:
+        return self._isr_backing_arr[10]
+
+    @property
+    def drive_power(self) -> int:
+        return self._isr_backing_arr[11]
+
+    @drive_power.setter
+    def drive_power(self, value: int):
+        value = min(value, 4095)
+        value = max(value, 0)
+        self._isr_backing_arr[11] = value
+
     def _set_up_isr_vars(self):
         # Access to self._anything is slow for the ISR.  Put all the
         # fields needed by the ISR into an array so that we can look
@@ -312,7 +326,7 @@ class Motor:
             [
                 0,  # 0 = DMA'd sensor value
                 0,  # 1 = DMA timstamp
-                0,  # 2 = last processed value
+                0,  # 2 = last angle
                 0,  # 3 = last processed timestamp
                 0,  # 4 = num pole pairs
                 0,  # 5 = angle offset
@@ -320,6 +334,8 @@ class Motor:
                 addressof(self._lut),  # 7 = ptr16(self._lut)
                 self._pwm_duty_addrs[0],  # 8 = duty_addrs[0]
                 self._pwm_duty_addrs[1],  # 9 = duty_addrs[1]
+                0,  # 10 = measured speed
+                1024,  # 11 = drive power (4096ths)
             ],
         )
         self._isr_vars = memoryview(self._isr_backing_arr)
@@ -338,6 +354,8 @@ class Motor:
             # Data is actually two 16-bit counters packed into
             # a 32-bit word.
             packed_value = vars[0]
+            timestamp = vars[1]
+
             raw_invl = packed_value & 0xFFFF
             raw_high = (packed_value >> 16) & 0xFFFF
             invl = 0xFFFF - raw_invl
@@ -349,13 +367,27 @@ class Motor:
             if angle > 4095:
                 angle = 0
 
+            last_angle = vars[2]
+            last_timestamp = vars[3]
+            delta = angle - last_angle
+            if delta < -2048:
+                delta += 4096
+            elif delta >= 2048:
+                delta -= 4096
+
+            delta_t = timestamp - last_timestamp
+            speed = (delta * 1000) // delta_t
+            vars[10] = speed
+            vars[2] = angle
+            vars[3] = timestamp
+
             num_pole_pairs = vars[4]
             angle_offset = vars[5]
             pole_angle: int = angle * num_pole_pairs + angle_offset
             drive_offset = vars[6]
             drive_angle: int = pole_angle + drive_offset
 
-            power = 1024
+            power = vars[11]
             lut_ptr = ptr16(vars[7])
             tap1 = drive_angle & 0xFFF
             tap2 = (drive_angle + 1365) & 0xFFF
@@ -440,6 +472,9 @@ def run():
 
         drive_offset = 1024
         a_was_pressed = False
+        b_was_pressed = False
+
+        last_print_ms = time.ticks_ms()
 
         while True:
             if stop:
@@ -453,13 +488,24 @@ def run():
 
             a_pressed = yukon.is_pressed("A")
             if a_pressed and not a_was_pressed:
-                print("Switch direction")
-                motor.drive_offset = 4096 - motor.drive_offset
+                print("Decrease power")
+                motor.drive_power -= 100
                 a_was_pressed = True
             elif not a_pressed:
                 a_was_pressed = False
 
+            b_pressed = yukon.is_pressed("B")
+            if b_pressed and not b_was_pressed:
+                print("Increase power")
+                motor.drive_power += 100
+                b_was_pressed = True
+            elif not b_pressed:
+                b_was_pressed = False
+
             time.sleep_ms(1)
+            if time.ticks_ms() - last_print_ms > 1000:
+                print(motor.speed * 1000 / 4096)
+                last_print_ms = time.ticks_ms()
     finally:
         print("Shutting down")
         motor.stop()
