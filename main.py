@@ -245,6 +245,15 @@ class Motor:
             angle = 0
         return angle
 
+    def start(self):
+        self._sensor_sm.irq(
+            self.update, trigger=rp2.StateMachine.IRQ_RXNEMPTY, hard=True
+        )
+
+    def stop(self):
+        self._sensor_sm.irq(None)
+        self._set_duty(0, 0)
+
     @micropython.viper
     def update(self, pio):
         pin_debug.on()
@@ -348,14 +357,10 @@ def run():
         motor = Motor(0, 6)
         motor.calibrate()
 
+        motor.start()
+
         drive_offset = 1024
         a_was_pressed = False
-
-        # Attach interrupt handler to the "FIFO has data" interrupt.
-        # FIXME Move interrupt setup to class
-        # FIXME Can this handle multiple ISRs for different hooks?
-        INTR_SM0_RXNEMPTY = 0x001
-        rp2.PIO(0).irq(motor.update, trigger=INTR_SM0_RXNEMPTY, hard=True)
 
         while True:
             if stop:
@@ -373,16 +378,9 @@ def run():
                 a_was_pressed = True
             elif not a_pressed:
                 a_was_pressed = False
-
-            # Do some float operations and GC to prove that the IRQ is
-            # decoupled from the main loop.
-            # print("Random:", random.random())
-            # print("Alloc:", gc.mem_alloc())
-            gc.collect()
     finally:
         print("Shutting down")
-        rp2.PIO(0).irq(None)
-        motor._set_duty(0, 0)
+        motor.stop()
 
 
 try:
