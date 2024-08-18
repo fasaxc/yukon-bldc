@@ -503,7 +503,7 @@ def run():
                 target_speed += 0.5
                 if target_speed > 10:
                     target_speed = 10
-                print("Increase speed", motor.drive_power)
+                print("Increase speed", target_speed)
                 b_was_pressed = True
             elif not b_pressed:
                 b_was_pressed = False
@@ -525,7 +525,7 @@ def run():
             time.sleep_ms(1)
             if time.ticks_ms() - last_print_ms > 1000:
                 # Unit is 4096ths per millisecond.  Convert to RPS.
-                print(motor_rps)
+                print(motor_rps, motor.drive_power)
                 last_print_ms = time.ticks_ms()
     finally:
         print("Shutting down")
