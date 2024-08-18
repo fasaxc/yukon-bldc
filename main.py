@@ -70,8 +70,10 @@ class Motor:
         self._sensor_sm_num = pio_sm_num
         if pio_sm_num < 4:
             pio_base = 0x50200000
+            pio_dreq_base = 4
         else:
             pio_base = 0x50300000
+            pio_dreq_base = 12
         self._sensor_fifo_addr = pio_base + 0x20 + (pio_sm_num % 4)
         self._sensor_debug_addr = pio_base + 0x8
         self._sensor_rx_stall_mask = 1 << (pio_sm_num % 4)
@@ -92,6 +94,45 @@ class Motor:
         # 1024 = +90 degrees
         # 3072 = -90 degrees
         self.drive_offset: int = 1024
+
+        # DMA
+        # Calculate RX FIFO DREQ number.
+        dreq_idx = pio_dreq_base + (pio_sm_num % 4)
+        print("SM=", pio_sm_num, "dreq=", dreq_idx)
+
+        self._dma_target = array.array("I", [0, 0])
+        self._sm_dma = rp2.DMA()
+        self._time_dma = rp2.DMA()
+
+        c = self._time_dma.pack_ctrl(
+            inc_read=False,
+            inc_write=False,
+            chain_to=self._sm_dma.channel,
+            irq_quiet=0,
+        )
+        self._time_dma.config(
+            read=0x40054000 + 0x28,  # TIMERAWL
+            write=memoryview(self._dma_target)[1:],
+            count=1,
+            ctrl=c,
+            trigger=False,
+        )
+
+        # Transfer from the RX FIFO to our buffer.  No increments.
+        # Pace transfer by the PIO DREQ.  Chain to the time DMA.
+        c = self._sm_dma.pack_ctrl(
+            inc_read=False,
+            inc_write=False,
+            treq_sel=dreq_idx,
+            chain_to=self._time_dma.channel,
+        )
+        self._sm_dma.config(
+            read=self._sensor_sm,  # RX FIFO
+            write=self._dma_target,
+            count=1,
+            ctrl=c,
+            trigger=True,
+        )
 
     @classmethod
     def _init_lut(cls):
@@ -206,30 +247,15 @@ class Motor:
     def _read_pwm_slow(self) -> int:
         """Read next value from the PWM FIFO.
 
-        Detects FIFO overflow and resyncs with the PWM signal
-        if needed (this takes 2-3 PWM cycles).
-
         Returns the wheel angle in 4096ths.
         """
-        # Drain the FIFO.
-        while self._sensor_sm.rx_fifo() > 0:
-            _ = self._sensor_sm.get()
 
-        # Then, block waiting for the next value...
-        reads_needed = 1
-        while reads_needed > 0:
-            packed_value = self._sensor_sm.get()
-            reads_needed -= 1
-
-            # Check for an earlier FIFO stall.  If there was a stall, the value
-            # we read might be junk.
-            if machine.mem32[self._sensor_debug_addr] & self._sensor_rx_stall_mask:
-                print("FIFO stall")
-                # Do two more reads plus the FIFO length, in case of a long GC stall.
-                reads_needed = 2 + self._sensor_sm.rx_fifo()
-                machine.mem32[self._sensor_debug_addr + 0x3000] = (
-                    self._sensor_rx_stall_mask
-                )
+        # Wait for the next DMA update.
+        packed_value, start_time = self._dma_target
+        while True:
+            packed_value, time = self._dma_target
+            if time != start_time:
+                break
 
         # Data is actually two 16-bit counters packed into
         # a 32-bit word.
@@ -246,23 +272,25 @@ class Motor:
         return angle
 
     def start(self):
-        self._sensor_sm.irq(
-            self.update, trigger=rp2.StateMachine.IRQ_RXNEMPTY, hard=True
-        )
+        print("Enabling DMA IRQ...")
+        self._time_dma.irq(handler=self.update, hard=True)
 
     def stop(self):
-        self._sensor_sm.irq(None)
+        print("Disabling DMA IRQ...")
+        self._time_dma.irq(None)
         self._set_duty(0, 0)
 
+    def close(self):
+        self._time_dma.close()
+        self._sm_dma.close()
+
     @micropython.viper
-    def update(self, pio):
+    def update(self, dma):
         pin_debug.on()
         try:
-            fifo = ptr32(self._sensor_fifo_addr)
-
             # Data is actually two 16-bit counters packed into
             # a 32-bit word.
-            packed_value = fifo[0]
+            packed_value = ptr32(self._dma_target)[0]
             raw_invl = packed_value & 0xFFFF
             raw_high = (packed_value >> 16) & 0xFFFF
             invl = 0xFFFF - raw_invl
@@ -378,9 +406,13 @@ def run():
                 a_was_pressed = True
             elif not a_pressed:
                 a_was_pressed = False
+
+            time.sleep_ms(1000)
+            print("Main loop...")
     finally:
         print("Shutting down")
         motor.stop()
+        motor.close()
 
 
 try:
