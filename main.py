@@ -476,6 +476,8 @@ def run():
 
         last_print_ms = time.ticks_ms()
 
+        target_speed = 2
+
         while True:
             if stop:
                 print("Interrupt in IRQ, stopping")
@@ -488,23 +490,42 @@ def run():
 
             a_pressed = yukon.is_pressed("A")
             if a_pressed and not a_was_pressed:
-                motor.drive_power -= 100
-                print("Decrease power", motor.drive_power)
+                target_speed -= 0.5
+                if target_speed < -10:
+                    target_speed = -10
+                print("Decrease speed", target_speed)
                 a_was_pressed = True
             elif not a_pressed:
                 a_was_pressed = False
 
             b_pressed = yukon.is_pressed("B")
             if b_pressed and not b_was_pressed:
-                motor.drive_power += 100
-                print("Increase power", motor.drive_power)
+                target_speed += 0.5
+                if target_speed > 10:
+                    target_speed = 10
+                print("Increase speed", motor.drive_power)
                 b_was_pressed = True
             elif not b_pressed:
                 b_was_pressed = False
 
+            motor_rps = motor.speed * 1000 / 4096
+            if target_speed < 0:
+                motor.drive_offset = 3072
+                if motor_rps < target_speed:
+                    motor.drive_power -= 10
+                if motor_rps > target_speed:
+                    motor.drive_power += 10
+            else:
+                motor.drive_offset = 1024
+                if motor_rps < target_speed:
+                    motor.drive_power += 10
+                if motor_rps > target_speed:
+                    motor.drive_power -= 10
+
             time.sleep_ms(1)
             if time.ticks_ms() - last_print_ms > 1000:
-                print(motor.speed * 1000 / 4096)
+                # Unit is 4096ths per millisecond.  Convert to RPS.
+                print(motor_rps)
                 last_print_ms = time.ticks_ms()
     finally:
         print("Shutting down")
