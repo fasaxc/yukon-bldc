@@ -94,6 +94,8 @@ class Motor:
 
         self._set_up_isr_vars()
 
+        # Two DMAs, one for copying the sensor reading. The second for
+        # copying a timestamp.
         self._sm_dma = rp2.DMA()
         self._time_dma = rp2.DMA()
 
@@ -166,7 +168,7 @@ class Motor:
         for bank in self._pwm_banks:
             pwm_en_mask |= 1 << bank
 
-        # Disable our PWM banks.  Whiting to the "clear" version of the
+        # Disable our PWM banks.  Writing to the "clear" version of the
         # register clears the bits in the mask.
         machine.mem32[pwm_en_clr] = pwm_en_mask
 
@@ -308,6 +310,22 @@ class Motor:
         return self._isr_backing_arr[10]
 
     @property
+    def correction(self) -> int:
+        return self._isr_backing_arr[12]
+
+    @property
+    def angle(self) -> int:
+        return self._isr_backing_arr[2]
+
+    @property
+    def corrected_angle(self) -> int:
+        return self._isr_backing_arr[13]
+
+    @property
+    def delay(self) -> int:
+        return self._isr_backing_arr[14]
+
+    @property
     def drive_power(self) -> int:
         return self._isr_backing_arr[11]
 
@@ -322,7 +340,7 @@ class Motor:
         # fields needed by the ISR into an array so that we can look
         # up its address exactly once and then do fast memory-access.
         self._isr_backing_arr = array.array(
-            "I",
+            "i",
             [
                 0,  # 0 = DMA'd sensor value
                 0,  # 1 = DMA timstamp
@@ -336,6 +354,9 @@ class Motor:
                 self._pwm_duty_addrs[1],  # 9 = duty_addrs[1]
                 0,  # 10 = measured speed
                 1024,  # 11 = drive power (4096ths)
+                0,  # 12 = correction
+                0,  # 13 = corrected angle
+                0,  # 14 = delay
             ],
         )
         self._isr_vars = memoryview(self._isr_backing_arr)
@@ -351,6 +372,7 @@ class Motor:
             # support const() so we can't name our indexes.
             vars = ptr32(self._isr_vars_addr)
 
+            # Load the most recent reading that the DMA copied.
             # Data is actually two 16-bit counters packed into
             # a 32-bit word.
             packed_value = vars[0]
@@ -367,6 +389,7 @@ class Motor:
             if angle > 4095:
                 angle = 0
 
+            # Calculate speed...
             last_angle = vars[2]
             last_timestamp = vars[3]
             delta = angle - last_angle
@@ -375,11 +398,31 @@ class Motor:
             elif delta >= 2048:
                 delta -= 4096
 
-            delta_t = timestamp - last_timestamp
-            speed = (delta * 1000) // delta_t
+            reading_invl = timestamp - last_timestamp
+            # Factor of 1000 for PWM frequency.
+            speed = (delta * 1000) // reading_invl
             vars[10] = speed
             vars[2] = angle
             vars[3] = timestamp
+
+            # Predict the current position of the motor based on
+            # speed, time since the reading and the expected delay
+            # from the sensor.
+            timerawl = ptr32(0x40054000 + 0x28)
+            now = timerawl[0]
+            #          + 1500us for sensor reading/switching delay
+            us_since_reading = now - timestamp + 1500
+            #          4096ths/ms * us // 1000 = 4096ths
+            correction = speed * us_since_reading // 1000
+            angle += correction
+            if angle < 0:
+                angle += 4096
+            if angle >= 4096:
+                angle -= 4096
+
+            vars[12] = correction
+            vars[13] = angle
+            vars[14] = us_since_reading
 
             num_pole_pairs = vars[4]
             angle_offset = vars[5]
@@ -415,7 +458,7 @@ class Motor:
         pin_debug.off()
 
 
-# Clamp and angle into [-2048, 2048)
+# Clamp an angle into [-2048, 2048)
 @micropython.viper
 def clamp_angle(angle: int) -> int:
     angle = angle % 4096
@@ -491,8 +534,8 @@ def run():
             a_pressed = yukon.is_pressed("A")
             if a_pressed and not a_was_pressed:
                 target_speed -= 0.5
-                if target_speed < -10:
-                    target_speed = -10
+                if target_speed < -20:
+                    target_speed = -20
                 print("Decrease speed", target_speed)
                 a_was_pressed = True
             elif not a_pressed:
@@ -501,13 +544,14 @@ def run():
             b_pressed = yukon.is_pressed("B")
             if b_pressed and not b_was_pressed:
                 target_speed += 0.5
-                if target_speed > 10:
-                    target_speed = 10
+                if target_speed > 20:
+                    target_speed = 20
                 print("Increase speed", target_speed)
                 b_was_pressed = True
             elif not b_pressed:
                 b_was_pressed = False
 
+            # Unit is 4096ths per millisecond.  Convert to RPS.
             motor_rps = motor.speed * 1000 / 4096
             if target_speed < 0:
                 motor.drive_offset = 3072
@@ -524,8 +568,15 @@ def run():
 
             time.sleep_ms(1)
             if time.ticks_ms() - last_print_ms > 1000:
-                # Unit is 4096ths per millisecond.  Convert to RPS.
-                print(motor_rps, motor.drive_power)
+                print(
+                    motor.speed,
+                    motor_rps,
+                    motor.drive_power,
+                    motor.delay,
+                    motor.angle,
+                    motor.correction,
+                    motor.corrected_angle,
+                )
                 last_print_ms = time.ticks_ms()
     finally:
         print("Shutting down")
