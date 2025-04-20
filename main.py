@@ -98,17 +98,36 @@ class Motor:
         # copying a timestamp.
         self._sm_dma = rp2.DMA()
         self._time_dma = rp2.DMA()
+        self._dummy_dma = rp2.DMA()
 
         c = self._time_dma.pack_ctrl(
             inc_read=False,
             inc_write=False,
-            chain_to=self._sm_dma.channel,
+            chain_to=self._dummy_dma.channel,
             irq_quiet=0,
         )
         self._time_dma.config(
             read=0x40054000 + 0x28,  # TIMERAWL
             write=self._dma_target[1:],
             count=1,
+            ctrl=c,
+            trigger=False,
+        )
+
+        # Third DMA to re-trigger the update a few times
+        dma_timer0_addr = 0x50000000 + 0x420
+        machine.mem32[dma_timer0_addr] = 1 << 16 | 3000
+        c = self._dummy_dma.pack_ctrl(
+            inc_read=False,
+            inc_write=False,
+            chain_to=self._sm_dma.channel,
+            treq_sel=0x3B,  # TIMER0
+            irq_quiet=0,
+        )
+        self._dummy_dma.config(
+            read=0x40054000 + 0x28,  # TIMERAWL
+            write=self._dummy_dma_target[:1],
+            count=20,
             ctrl=c,
             trigger=False,
         )
@@ -191,6 +210,7 @@ class Motor:
         # Calibration: rotate by a quarter phase to capture the rotor.
         # Seems to be a good angle to read off the angle offset.  Maybe
         # because the first duty is at 100%?
+        print("Calibrating motor...")
         for phase_angle in range(self._lut_len // 4):
             time.sleep_us(100)
             pin_debug.on()
@@ -270,11 +290,13 @@ class Motor:
 
     def start(self):
         print("Enabling DMA IRQ...")
+        self._dummy_dma.irq(handler=self.update, hard=True)
         self._time_dma.irq(handler=self.update, hard=True)
 
     def stop(self):
         print("Disabling DMA IRQ...")
         self._time_dma.irq(None)
+        self._dummy_dma.irq(None)
         self._set_duty(0, 0)
 
     def close(self):
@@ -363,6 +385,8 @@ class Motor:
         self._dma_target = self._isr_vars[:2]
         self._isr_vars_addr = addressof(self._isr_backing_arr)
 
+        self._dummy_dma_target = memoryview(array.array("I", [0]))
+
     @micropython.viper
     def update(self, dma):
         pin_debug.on()
@@ -377,33 +401,40 @@ class Motor:
             # a 32-bit word.
             packed_value = vars[0]
             timestamp = vars[1]
-
-            raw_invl = packed_value & 0xFFFF
-            raw_high = (packed_value >> 16) & 0xFFFF
-            invl = 0xFFFF - raw_invl
-            high = 0xFFFF - raw_high
-            angle = high * 4119 // invl - 15
-            # TODO: <16 means "error"
-            if angle < 0:
-                angle = 0
-            if angle > 4095:
-                angle = 0
-
-            # Calculate speed...
-            last_angle = vars[2]
             last_timestamp = vars[3]
-            delta = angle - last_angle
-            if delta < -2048:
-                delta += 4096
-            elif delta >= 2048:
-                delta -= 4096
 
-            reading_invl = timestamp - last_timestamp
-            # Factor of 1000 for PWM frequency.
-            speed = (delta * 1000) // reading_invl
-            vars[10] = speed
-            vars[2] = angle
-            vars[3] = timestamp
+            if timestamp != last_timestamp or last_timestamp == 0:
+                # First time through or new value arrived.
+
+                raw_invl = packed_value & 0xFFFF
+                raw_high = (packed_value >> 16) & 0xFFFF
+                invl = 0xFFFF - raw_invl
+                high = 0xFFFF - raw_high
+                angle = high * 4119 // invl - 15
+                # TODO: <16 means "error"
+                if angle < 0:
+                    angle = 0
+                if angle > 4095:
+                    angle = 0
+
+                # Calculate speed...
+                last_angle = vars[2]
+                delta = angle - last_angle
+                if delta < -2048:
+                    delta += 4096
+                elif delta >= 2048:
+                    delta -= 4096
+
+                reading_invl = timestamp - last_timestamp
+                # Factor of 1000 for PWM frequency.
+                speed = (delta * 1000) // reading_invl
+                vars[10] = speed
+                vars[2] = angle
+                vars[3] = timestamp
+            else:
+                # No new value arrived.  Use the last one.
+                angle = vars[2]
+                speed = vars[10]
 
             # Predict the current position of the motor based on
             # speed, time since the reading and the expected delay
@@ -439,11 +470,13 @@ class Motor:
             duty2 = (lut_ptr[tap2] * power) >> 18
             duty3 = (lut_ptr[tap3] * power) >> 18
 
-            # Want to do this but each method call costs 10us, which
-            # is far too much.
+            # Inlined version of:
+            #
             # pwms[0].duty_u16(duty1)
             # pwms[1].duty_u16(duty2)
             # pwms[2].duty_u16(duty3)
+            #
+            # Saves 10us per call.
 
             # 20 = 2A 0x40050034 LSB
             # 21 = 2B            MSB
@@ -508,10 +541,15 @@ def run():
     try:
         yukon.enable_main_output()
 
-        motor = Motor(0, 6)
+        motor = Motor(0, 1)
         motor.calibrate()
 
         motor.start()
+
+        # motor2 = Motor(1, 6)
+        # motor2.calibrate()
+
+        # motor2.start()
 
         drive_offset = 1024
         a_was_pressed = False
@@ -567,7 +605,7 @@ def run():
                     motor.drive_power -= 10
 
             time.sleep_ms(1)
-            if time.ticks_ms() - last_print_ms > 1000:
+            if time.ticks_ms() - last_print_ms > 1100:
                 print(
                     motor.speed,
                     motor_rps,
@@ -582,6 +620,8 @@ def run():
         print("Shutting down")
         motor.stop()
         motor.close()
+        # motor2.stop()
+        # motor2.close()
 
 
 try:
