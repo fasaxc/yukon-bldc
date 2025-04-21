@@ -54,6 +54,7 @@ class Motor:
         """
         # One-off look-up-table initialisation.
         self._init_lut()
+        self._pwm_freq = pwm_freq
 
         # We use the first three GPIOs in the block for the motor outputs.
         first_gpio_num = (slot_num - 1) * 4
@@ -103,7 +104,7 @@ class Motor:
         c = self._time_dma.pack_ctrl(
             inc_read=False,
             inc_write=False,
-            chain_to=self._dummy_dma.channel,
+            chain_to=self._sm_dma.channel,
             irq_quiet=0,
         )
         self._time_dma.config(
@@ -116,18 +117,19 @@ class Motor:
 
         # Third DMA to re-trigger the update a few times
         dma_timer0_addr = 0x50000000 + 0x420
-        machine.mem32[dma_timer0_addr] = 1 << 16 | 3000
+        dummy_dma_tick_hz = 40000
+        dummy_dma_fire_hz = 4000
+        machine.mem32[dma_timer0_addr] = 1 << 16 | 4000
         c = self._dummy_dma.pack_ctrl(
             inc_read=False,
             inc_write=False,
-            chain_to=self._sm_dma.channel,
             treq_sel=0x3B,  # TIMER0
             irq_quiet=0,
         )
         self._dummy_dma.config(
             read=0x40054000 + 0x28,  # TIMERAWL
             write=self._dummy_dma_target[:1],
-            count=20,
+            count=5,
             ctrl=c,
             trigger=False,
         )
@@ -148,11 +150,15 @@ class Motor:
             trigger=True,
         )
 
+        self._isr_backing_arr[16] = (
+            0x50000000 + (self._dummy_dma.channel * 0x40) + 0x3C
+        )  # 16 = dummy DMA read addr trig
+
     @classmethod
     def _init_lut(cls):
         if cls._lut is not None:
             return
-        third = 4096 // 3
+        print("Initialising LUT")
         # This fraction of the PWM duty cycle should match the switching
         # delay of the motor driver.
         min_on_fraction = 0.016
@@ -167,6 +173,7 @@ class Motor:
 
     def _configure_pwms(self, f):
         # Start with the basic configuration via the library.
+        print("Configuring PWMs")
         for pwm in self._motor_pwms:
             pwm.freq(f * 2)  # factor of 2 due to phase accurate mode.
 
@@ -353,7 +360,7 @@ class Motor:
 
     @drive_power.setter
     def drive_power(self, value: int):
-        value = min(value, 4095)
+        value = min(value, (machine.freq() // self._pwm_freq) - 10)
         value = max(value, 0)
         self._isr_backing_arr[11] = value
 
@@ -379,6 +386,8 @@ class Motor:
                 0,  # 12 = correction
                 0,  # 13 = corrected angle
                 0,  # 14 = delay
+                0,  # 15 = dummy DMA retrigger count
+                0,  # 16 = dummy DMA trigger address
             ],
         )
         self._isr_vars = memoryview(self._isr_backing_arr)
@@ -403,6 +412,7 @@ class Motor:
             timestamp = vars[1]
             last_timestamp = vars[3]
 
+            timerrawl_addr = int(0x40054028)
             if timestamp != last_timestamp or last_timestamp == 0:
                 # First time through or new value arrived.
 
@@ -431,15 +441,22 @@ class Motor:
                 vars[10] = speed
                 vars[2] = angle
                 vars[3] = timestamp
+                vars[15] = 3
+                trig_ptr = ptr32(vars[16])
+                trig_ptr[0] = timerrawl_addr
             else:
                 # No new value arrived.  Use the last one.
                 angle = vars[2]
                 speed = vars[10]
+                if vars[15] > 0:
+                    vars[15] -= 1
+                    trig_ptr = ptr32(vars[16])
+                    trig_ptr[0] = timerrawl_addr
 
             # Predict the current position of the motor based on
             # speed, time since the reading and the expected delay
             # from the sensor.
-            timerawl = ptr32(0x40054000 + 0x28)
+            timerawl = ptr32(timerrawl_addr)
             now = timerawl[0]
             #          + 1500us for sensor reading/switching delay
             us_since_reading = now - timestamp + 1500
@@ -463,12 +480,12 @@ class Motor:
 
             power = vars[11]
             lut_ptr = ptr16(vars[7])
-            tap1 = drive_angle & 0xFFF
+            tap1 = drive_angle & 0xFFF  # FIXME
             tap2 = (drive_angle + 1365) & 0xFFF
             tap3 = (drive_angle + 2731) & 0xFFF
-            duty1 = (lut_ptr[tap1] * power) >> 18  # Extra shift of 6 for PWM TOP scale.
-            duty2 = (lut_ptr[tap2] * power) >> 18
-            duty3 = (lut_ptr[tap3] * power) >> 18
+            duty1 = (lut_ptr[tap1] * power) >> 16
+            duty2 = (lut_ptr[tap2] * power) >> 16
+            duty3 = (lut_ptr[tap3] * power) >> 16
 
             # Inlined version of:
             #
@@ -536,11 +553,13 @@ def pio_read_pwm():
     wrap()  # }                       # type:ignore
 
 
-@micropython.native
+# @micropython.native
 def run():
+    motor = None
     try:
+        print("Starting up")
         yukon.enable_main_output()
-
+        print("Enabled main output")
         motor = Motor(0, 1)
         motor.calibrate()
 
@@ -557,7 +576,8 @@ def run():
 
         last_print_ms = time.ticks_ms()
 
-        target_speed = 2
+        max_speed = 40
+        target_speed = 20
 
         while True:
             if stop:
@@ -572,8 +592,8 @@ def run():
             a_pressed = yukon.is_pressed("A")
             if a_pressed and not a_was_pressed:
                 target_speed -= 0.5
-                if target_speed < -20:
-                    target_speed = -20
+                if target_speed < -max_speed:
+                    target_speed = -max_speed
                 print("Decrease speed", target_speed)
                 a_was_pressed = True
             elif not a_pressed:
@@ -582,8 +602,8 @@ def run():
             b_pressed = yukon.is_pressed("B")
             if b_pressed and not b_was_pressed:
                 target_speed += 0.5
-                if target_speed > 20:
-                    target_speed = 20
+                if target_speed > max_speed:
+                    target_speed = max_speed
                 print("Increase speed", target_speed)
                 b_was_pressed = True
             elif not b_pressed:
@@ -616,10 +636,14 @@ def run():
                     motor.corrected_angle,
                 )
                 last_print_ms = time.ticks_ms()
+    except BaseException as e:
+        print("Exception in main loop", e)
+        raise
     finally:
         print("Shutting down")
-        motor.stop()
-        motor.close()
+        if motor is not None:
+            motor.stop()
+            motor.close()
         # motor2.stop()
         # motor2.close()
 
