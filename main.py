@@ -1,6 +1,6 @@
 import micropython
 
-micropython.alloc_emergency_exception_buf(1000)
+micropython.alloc_emergency_exception_buf(2000)
 
 import array
 from uctypes import addressof
@@ -69,16 +69,10 @@ class Motor:
         # with a PIO program to read the PWM signal.
         sensor_pin_num = first_gpio_num + 3
         self._sensor_pin = Pin(sensor_pin_num, Pin.IN, Pin.PULL_UP)
-        self._sensor_sm_num = pio_sm_num
         if pio_sm_num < 4:
-            pio_base = 0x50200000
             pio_dreq_base = 4
         else:
-            pio_base = 0x50300000
             pio_dreq_base = 12
-        self._sensor_fifo_addr = pio_base + 0x20 + (pio_sm_num % 4)
-        self._sensor_debug_addr = pio_base + 0x8
-        self._sensor_rx_stall_mask = 1 << (pio_sm_num % 4)
 
         self._sensor_sm = rp2.StateMachine(
             pio_sm_num,
@@ -115,10 +109,9 @@ class Motor:
             trigger=False,
         )
 
-        # Third DMA to re-trigger the update a few times
+        # Third DMA to re-trigger the update a few times.  TIMER0 emits a
+        # DREQ at sysclk * X/Y; X=1, Y=4000 gives ~31kHz with a 125MHz sysclk.
         dma_timer0_addr = 0x50000000 + 0x420
-        dummy_dma_tick_hz = 40000
-        dummy_dma_fire_hz = 4000
         machine.mem32[dma_timer0_addr] = 1 << 16 | 4000
         c = self._dummy_dma.pack_ctrl(
             inc_read=False,
@@ -168,7 +161,7 @@ class Motor:
         for i in range(cls._lut_len):
             sin = math.sin(i * two_pi / cls._lut_len)
             sin_scaled = (sin + 1) * scale_factor
-            sin_offset = sin_scaled + min_on_fraction
+            sin_offset = sin_scaled + (min_on_fraction * 65535)
             cls._lut.append(int(sin_offset))
 
     def _configure_pwms(self, f):
@@ -212,21 +205,23 @@ class Motor:
         # Start both PWMs together.
         machine.mem32[pwm_en_set] = pwm_en_mask
 
-    def calibrate(self):
-        # TODO: handle incorrect rotation direction.
-        # Calibration: rotate by a quarter phase to capture the rotor.
-        # Seems to be a good angle to read off the angle offset.  Maybe
-        # because the first duty is at 100%?
-        print("Calibrating motor...")
+    def _align_rotor(self) -> int:
+        """Drive the field to electrical angle 4096//4 and return the
+        settled sensor reading."""
         for phase_angle in range(self._lut_len // 4):
             time.sleep_us(100)
             pin_debug.on()
             self._set_duty(phase_angle, 1024)
             pin_debug.off()
-
         time.sleep_ms(500)  # Let rotor settle.
+        return self._read_pwm_slow()
 
-        angle1 = self._read_pwm_slow()
+    def calibrate(self):
+        # Calibration: rotate by a quarter phase to capture the rotor.
+        # Seems to be a good angle to read off the angle offset.  Maybe
+        # because the first duty is at 100%?
+        print("Calibrating motor...")
+        angle1 = self._align_rotor()
         print(
             "Calibration interval A = {} = {} deg".format(angle1, angle1 * 360 / 4096)
         )
@@ -244,27 +239,57 @@ class Motor:
         )
         delta = clamp_angle(angle2 - angle1)
         print("Delta = {} = {}".format(delta, delta * 360 / 4096))
+        if delta == 0:
+            # Rotor didn't move (or moved an exact whole number of mechanical
+            # turns, which we can't resolve): bad wiring/power or too few pole
+            # pairs for this two-revolution sweep.
+            raise ValueError("Calibration failed: no resolvable rotor movement")
+        direction = 1 if delta >= 0 else -1
         num_pole_pairs = (4096 * 2 * 32 // abs(delta) + 15) // 32
         print("Pole pairs = {}".format(num_pole_pairs))
+        print("Direction = {}".format(direction))
+        self.num_pole_pairs = num_pole_pairs
 
-        # Now we've got the number of poles, we can work out the phase offset.
-        pole_angle = 4096 // 4  # Angle we set when we did the measurement
-        meas_pole_angle = clamp_angle(angle1 * num_pole_pairs)
+        # If the sensor counts the opposite way to our phase order, swap two
+        # phases so that increasing drive angle always increases the sensor
+        # reading.  After this the whole system only ever sees one direction,
+        # so the hot commutation path needs no direction factor and the
+        # measured speed already has the right sign for the control loop.
+        if direction < 0:
+            print("Swapping phases to correct direction")
+            self._swap_phases()
+
+        # Re-align using the (possibly swapped) phase order and read the
+        # sensor to find the angle offset in that frame.
+        align_angle = self._align_rotor()
+        pole_angle = 4096 // 4  # Electrical angle we just drove to.
+        meas_pole_angle = clamp_angle(align_angle * num_pole_pairs)
         angle_offset = clamp_angle(pole_angle - meas_pole_angle)
         print("Angle offset = {}".format(angle_offset))
 
         self._set_duty(0, 0)
 
-        self.angle_offset, self.num_pole_pairs = angle_offset, num_pole_pairs
+        self.angle_offset = angle_offset
+
+    def _swap_phases(self):
+        # Swap the two non-zero LUT tap offsets.  This swaps two of the three
+        # motor phases, which reverses the field's direction of rotation.
+        # Both _set_duty() and the update() ISR read these offsets, so they
+        # stay in sync.
+        self._isr_backing_arr[17], self._isr_backing_arr[18] = (
+            self._isr_backing_arr[18],
+            self._isr_backing_arr[17],
+        )
 
     @micropython.viper
     def _set_duty(self, angle: int, power: int):
+        vars = ptr32(self._isr_vars_addr)
         lut_ptr = ptr16(self._lut)
         angle = angle & 0xFFF
         self._motor_pwms[0].duty_u16((lut_ptr[angle] * power) >> 12)
-        angle2 = (angle + 1365) & 0xFFF
+        angle2 = (angle + vars[17]) & 0xFFF
         self._motor_pwms[1].duty_u16((lut_ptr[angle2] * power) >> 12)
-        angle3 = (angle + 2731) & 0xFFF
+        angle3 = (angle + vars[18]) & 0xFFF
         self._motor_pwms[2].duty_u16((lut_ptr[angle3] * power) >> 12)
 
     def _read_pwm_slow(self) -> int:
@@ -309,6 +334,7 @@ class Motor:
     def close(self):
         self._time_dma.close()
         self._sm_dma.close()
+        self._dummy_dma.close()
 
     @property
     def num_pole_pairs(self) -> int:
@@ -360,7 +386,7 @@ class Motor:
 
     @drive_power.setter
     def drive_power(self, value: int):
-        value = min(value, (machine.freq() // self._pwm_freq) - 10)
+        value = min(value, (machine.freq() // (self._pwm_freq * 2)) - 10)
         value = max(value, 0)
         self._isr_backing_arr[11] = value
 
@@ -388,6 +414,8 @@ class Motor:
                 0,  # 14 = delay
                 0,  # 15 = dummy DMA retrigger count
                 0,  # 16 = dummy DMA trigger address
+                1365,  # 17 = phase B LUT tap offset (swapped to reverse dir)
+                2731,  # 18 = phase C LUT tap offset (swapped to reverse dir)
             ],
         )
         self._isr_vars = memoryview(self._isr_backing_arr)
@@ -435,9 +463,12 @@ class Motor:
                 elif delta >= 2048:
                     delta -= 4096
 
-                reading_invl = timestamp - last_timestamp
-                # Factor of 1000 for PWM frequency.
-                speed = (delta * 1000) // reading_invl
+                if last_timestamp == 0:
+                    speed = 0
+                else:
+                    reading_invl = timestamp - last_timestamp
+                    # Factor of 1000 for PWM frequency.
+                    speed = (delta * 1000) // reading_invl
                 vars[10] = speed
                 vars[2] = angle
                 vars[3] = timestamp
@@ -458,14 +489,14 @@ class Motor:
             # from the sensor.
             timerawl = ptr32(timerrawl_addr)
             now = timerawl[0]
-            #          + 1500us for sensor reading/switching delay
-            us_since_reading = now - timestamp + 1500
+            #          + 1250us for sensor reading/switching delay
+            us_since_reading = now - timestamp + 1250
             #          4096ths/ms * us // 1000 = 4096ths
             correction = speed * us_since_reading // 1000
             angle += correction
-            if angle < 0:
+            while angle < 0:
                 angle += 4096
-            if angle >= 4096:
+            while angle >= 4096:
                 angle -= 4096
 
             vars[12] = correction
@@ -480,9 +511,9 @@ class Motor:
 
             power = vars[11]
             lut_ptr = ptr16(vars[7])
-            tap1 = drive_angle & 0xFFF  # FIXME
-            tap2 = (drive_angle + 1365) & 0xFFF
-            tap3 = (drive_angle + 2731) & 0xFFF
+            tap1 = drive_angle & 0xFFF
+            tap2 = (drive_angle + vars[17]) & 0xFFF
+            tap3 = (drive_angle + vars[18]) & 0xFFF
             duty1 = (lut_ptr[tap1] * power) >> 16
             duty2 = (lut_ptr[tap2] * power) >> 16
             duty3 = (lut_ptr[tap3] * power) >> 16
@@ -553,7 +584,6 @@ def pio_read_pwm():
     wrap()  # }                       # type:ignore
 
 
-# @micropython.native
 def run():
     motor = None
     try:
@@ -625,7 +655,7 @@ def run():
                     motor.drive_power -= 10
 
             time.sleep_ms(1)
-            if time.ticks_ms() - last_print_ms > 1100:
+            if time.ticks_diff(time.ticks_ms(), last_print_ms) > 1100:
                 print(
                     motor.speed,
                     motor_rps,
@@ -636,6 +666,9 @@ def run():
                     motor.corrected_angle,
                 )
                 last_print_ms = time.ticks_ms()
+                yukon.monitor_once()
+                readings = yukon.get_readings()
+                print("Current", readings["C_avg"])
     except BaseException as e:
         print("Exception in main loop", e)
         raise
